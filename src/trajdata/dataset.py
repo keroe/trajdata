@@ -7,6 +7,7 @@ import warnings
 from collections import defaultdict
 from functools import partial
 from itertools import chain
+import pickle
 from os.path import isfile
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
@@ -18,6 +19,12 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from trajdata import filtering
+from trajdata.utils.cache_utils import (
+    CacheCorruptionError,
+    delete_corrupted_file,
+    safe_dill_dump,
+    safe_dill_load,
+)
 from trajdata.augmentation.augmentation import Augmentation, BatchAugmentation
 from trajdata.caching import EnvCache, SceneCache, df_cache
 from trajdata.data_structures import (
@@ -157,9 +164,9 @@ class UnifiedDataset(Dataset):
             rank (int, optional): Proccess rank when using torch DistributedDataParallel for multi-GPU training. Only the rank 0 process will be used for caching.
         """
         self.desired_data: List[str] = desired_data
-        self.scene_description_contains: Optional[
-            List[str]
-        ] = scene_description_contains
+        self.scene_description_contains: Optional[List[str]] = (
+            scene_description_contains
+        )
         self.centric: str = centric
         self.desired_dt: float = desired_dt
 
@@ -172,12 +179,12 @@ class UnifiedDataset(Dataset):
         self.env_cache: EnvCache = EnvCache(self.cache_path)
 
         if incl_raster_map:
-            assert (
-                raster_map_params is not None
-            ), r"Path size information, i.e., {'px_per_m': ..., 'map_size_px': ...}, must be provided if incl_map=True"
-            assert (
-                raster_map_params["map_size_px"] % 2 == 0
-            ), "Patch parameter 'map_size_px' must be divisible by 2"
+            assert raster_map_params is not None, (
+                r"Path size information, i.e., {'px_per_m': ..., 'map_size_px': ...}, must be provided if incl_map=True"
+            )
+            assert raster_map_params["map_size_px"] % 2 == 0, (
+                "Patch parameter 'map_size_px' must be divisible by 2"
+            )
 
         require_map_cache = require_map_cache or incl_raster_map
 
@@ -328,9 +335,9 @@ class UnifiedDataset(Dataset):
                         ):
                             distributed.barrier()
 
-                    scenes_list: List[
-                        SceneMetadata
-                    ] = self._get_desired_scenes_from_env(matching_datasets, env)
+                    scenes_list: List[SceneMetadata] = (
+                        self._get_desired_scenes_from_env(matching_datasets, env)
+                    )
 
                 if self.incl_vector_map and env.metadata.map_locations is not None:
                     # env.metadata.map_locations can be none for map-containing
@@ -491,8 +498,7 @@ class UnifiedDataset(Dataset):
         index_cache_dir.mkdir(parents=True, exist_ok=True)
 
         index_cache_file: Path = index_cache_dir / "data_index.dill"
-        with open(index_cache_file, "wb") as f:
-            dill.dump(data_index, f)
+        safe_dill_dump(data_index, index_cache_file)
 
         args_file: Path = index_cache_dir / "index_args.json"
         with open(args_file, "w") as f:
@@ -510,8 +516,11 @@ class UnifiedDataset(Dataset):
         List[Tuple[str, int, List[Tuple[str, np.ndarray]]]],
     ]:
         index_cache_file: Path = self._index_cache_path() / "data_index.dill"
-        with open(index_cache_file, "rb") as f:
-            data_index = dill.load(f)
+        try:
+            data_index = safe_dill_load(index_cache_file)
+        except CacheCorruptionError:
+            delete_corrupted_file(index_cache_file)
+            raise
 
         if self.verbose:
             print(
@@ -527,8 +536,7 @@ class UnifiedDataset(Dataset):
         if isfile(cache_path):
             print(f"Loading cache from {cache_path} ...", end="")
             t = time.time()
-            with open(cache_path, "rb") as f:
-                self._cached_batch_elements, keep_ids = dill.load(f, encoding="latin1")
+            self._cached_batch_elements, keep_ids = safe_dill_load(Path(cache_path))
             print(f" done in {time.time() - t:.1f}s.")
 
         else:
@@ -565,8 +573,10 @@ class UnifiedDataset(Dataset):
 
             print(f"Saving cache to {cache_path} ....", end="")
             t = time.time()
-            with open(cache_path, "wb") as f:
-                dill.dump((cached_batch_elements, keep_ids), f)
+            safe_dill_dump(
+                (cached_batch_elements, keep_ids),
+                Path(cache_path),
+            )
             print(f" done in {time.time() - t:.1f}s.")
 
             self._cached_batch_elements = cached_batch_elements
@@ -650,7 +660,7 @@ class UnifiedDataset(Dataset):
         self._data_len = len(self._data_index)
 
         print(
-            f"Kept {self._data_len}/{old_len} elements, {self._data_len/old_len*100.0:.2f}%."
+            f"Kept {self._data_len}/{old_len} elements, {self._data_len / old_len * 100.0:.2f}%."
         )
 
     def _get_data_index(
@@ -874,8 +884,9 @@ class UnifiedDataset(Dataset):
     ) -> Union[List[Scene], List[SceneMetadata]]:
         scenes_list: Union[List[Scene], List[SceneMetadata]] = list()
         for scene_tag in tqdm(
-            scene_tags, desc=f"Getting Scenes from {env.name} with scene tag {scene_tags}",
-            disable=not self.verbose
+            scene_tags,
+            desc=f"Getting Scenes from {env.name} with scene tag {scene_tags}",
+            disable=not self.verbose,
         ):
             if env.name in scene_tag:
                 scenes_list += env.get_matching_scenes(
@@ -1063,7 +1074,15 @@ class UnifiedDataset(Dataset):
         elif self.centric == "agent":
             scene_path, agent_id, ts = self._data_index[idx]
 
-        scene: Scene = EnvCache.load(scene_path)
+        try:
+            scene: Scene = EnvCache.load(scene_path)
+        except CacheCorruptionError as e:
+            delete_corrupted_file(e.path)
+            raise RuntimeError(
+                f"Corrupted scene cache at {scene_path} (deleted for regeneration). "
+                f"Restart dataset initialization to regenerate."
+            ) from e
+
         scene_utils.enforce_desired_dt(scene, self.desired_dt)
         scene_cache: SceneCache = self.cache_class(
             self.cache_path, scene, self.augmentations

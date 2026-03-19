@@ -16,6 +16,11 @@ from scipy.stats import circmean
 
 import trajdata.proto.vectorized_map_pb2 as map_proto
 from trajdata.utils import arr_utils
+from trajdata.utils.cache_utils import (
+    CacheCorruptionError,
+    delete_corrupted_file,
+    safe_dill_load,
+)
 
 MM_PER_M: Final[float] = 1000
 
@@ -284,9 +289,9 @@ def load_kdtrees(
     if not kdtrees_path.exists():
         raise ValueError(f"{kdtrees_path} does not exist!")
 
-    with open(kdtrees_path, "rb") as f:
-        kdtrees: Dict[MapElementType, map_kdtree.MapElementKDTree] = dill.load(f)
-
+    kdtrees: Dict[MapElementType, map_kdtree.MapElementKDTree] = safe_dill_load(
+        kdtrees_path
+    )
     return kdtrees
 
 
@@ -307,7 +312,12 @@ def load_rtrees(
         )
         return None
 
-    with open(rtrees_path, "rb") as f:
-        rtrees: Dict[MapElementType, map_strtree.MapElementSTRTree] = dill.load(f)
+    try:
+        rtrees: Dict[MapElementType, map_strtree.MapElementSTRTree] = safe_dill_load(
+            rtrees_path
+        )
+    except CacheCorruptionError:
+        delete_corrupted_file(rtrees_path)
+        return None
 
     return rtrees

@@ -32,6 +32,13 @@ from trajdata.data_structures.scene_metadata import Scene
 from trajdata.data_structures.state import NP_STATE_TYPES, StateArray
 from trajdata.maps.traffic_light_status import TrafficLightStatus
 from trajdata.utils import arr_utils, df_utils, raster_utils, state_utils
+from trajdata.utils.cache_utils import (
+    atomic_write,
+    safe_dill_dump,
+    safe_dill_load,
+    safe_pickle_dump,
+    safe_pickle_load,
+)
 
 STATE_COLS: Final[List[str]] = ["x", "y", "z", "vx", "vy", "ax", "ay"]
 EXTENT_COLS: Final[List[str]] = ["length", "width", "height"]
@@ -148,18 +155,17 @@ class DataFrameCache(SceneCache):
             use_threads=False,
         ).set_index(["agent_id", "scene_ts"])
 
-        with open(
-            self.scene_dir / DataFrameCache._agent_data_index_file(scene_dt), "rb"
-        ) as f:
-            self.index_dict: Dict[Tuple[str, int], int] = pickle.load(f)
+        self.index_dict: Dict[Tuple[str, int], int] = safe_pickle_load(
+            self.scene_dir / DataFrameCache._agent_data_index_file(scene_dt)
+        )
 
         self._get_and_reorder_col_idxs()
 
     def write_cache_to_disk(self) -> None:
-        with open(
-            self.scene_dir / DataFrameCache._agent_data_index_file(self.dt), "wb"
-        ) as f:
-            pickle.dump(self.index_dict, f)
+        safe_pickle_dump(
+            self.index_dict,
+            self.scene_dir / DataFrameCache._agent_data_index_file(self.dt),
+        )
 
         self.scene_data_df.reset_index().to_feather(
             self.scene_dir / DataFrameCache._agent_data_file(self.dt)
@@ -179,10 +185,10 @@ class DataFrameCache(SceneCache):
         index_dict: Dict[Tuple[str, int], int] = {
             val: idx for idx, val in enumerate(agent_data.index)
         }
-        with open(
-            scene_cache_dir / DataFrameCache._agent_data_index_file(scene.dt), "wb"
-        ) as f:
-            pickle.dump(index_dict, f)
+        safe_pickle_dump(
+            index_dict,
+            scene_cache_dir / DataFrameCache._agent_data_index_file(scene.dt),
+        )
 
         agent_data.reset_index().to_feather(
             scene_cache_dir / DataFrameCache._agent_data_file(scene.dt)
@@ -778,24 +784,25 @@ class DataFrameCache(SceneCache):
         # Ensuring the maps directory exists.
         maps_path.mkdir(parents=True, exist_ok=True)
 
-        # Saving the vectorized map data.
-        with open(vector_map_path, "wb") as f:
-            f.write(vector_map.to_proto().SerializeToString())
+        # Saving the vectorized map data (atomic write).
+        proto_bytes = vector_map.to_proto().SerializeToString()
 
-        # Saving precomputed map element kdtrees.
-        with open(kdtrees_path, "wb") as f:
-            dill.dump(vector_map.search_kdtrees, f)
+        def _write_proto(f) -> None:
+            f.write(proto_bytes)
 
-        # Saving precomputed map element rtrees.
-        with open(rtrees_path, "wb") as f:
-            dill.dump(vector_map.search_rtrees, f)
+        atomic_write(vector_map_path, _write_proto)
+
+        # Saving precomputed map element kdtrees (atomic write).
+        safe_dill_dump(vector_map.search_kdtrees, kdtrees_path)
+
+        # Saving precomputed map element rtrees (atomic write).
+        safe_dill_dump(vector_map.search_rtrees, rtrees_path)
 
         # Saving the rasterized map data.
         zarr.save(raster_map_path, rasterized_map.data)
 
-        # Saving the rasterized map metadata.
-        with open(raster_metadata_path, "wb") as f:
-            dill.dump(rasterized_map.metadata, f)
+        # Saving the rasterized map metadata (atomic write).
+        safe_dill_dump(rasterized_map.metadata, raster_metadata_path)
 
     def pad_map_patch(
         self,
@@ -833,9 +840,7 @@ class DataFrameCache(SceneCache):
             self.path, self.scene.env_name, self.scene.location, 0.0
         )
 
-        with open(kdtrees_path, "rb") as f:
-            kdtrees: Dict[str, MapElementKDTree] = dill.load(f)
-
+        kdtrees: Dict[str, MapElementKDTree] = safe_dill_load(kdtrees_path)
         return kdtrees
 
     def get_kdtrees(self, load_only_once: bool = True):
@@ -856,6 +861,8 @@ class DataFrameCache(SceneCache):
             return self._kdtrees
 
     def load_rtrees(self) -> MapElementSTRTree:
+        from trajdata.utils.cache_utils import CacheCorruptionError, delete_corrupted_file
+
         _, _, _, rtrees_path, _, _ = DataFrameCache.get_map_paths(
             self.path, self.scene.env_name, self.scene.location, 0.0
         )
@@ -874,8 +881,11 @@ class DataFrameCache(SceneCache):
             )
             return None
 
-        with open(rtrees_path, "rb") as f:
-            rtrees: MapElementSTRTree = dill.load(f)
+        try:
+            rtrees: MapElementSTRTree = safe_dill_load(rtrees_path)
+        except CacheCorruptionError:
+            delete_corrupted_file(rtrees_path)
+            return None
 
         return rtrees
 

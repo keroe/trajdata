@@ -1,9 +1,8 @@
 from pathlib import Path
 from typing import List, NamedTuple, Union
 
-import dill
-
 from trajdata.data_structures.scene_metadata import Scene
+from trajdata.utils.cache_utils import safe_dill_dump, safe_dill_load
 
 
 class EnvCache:
@@ -30,9 +29,7 @@ class EnvCache:
         scene_file: Path = EnvCache.scene_metadata_path(
             self.path, env_name, scene_name, scene_dt
         )
-        with open(scene_file, "rb") as f:
-            scene: Scene = dill.load(f)
-
+        scene: Scene = safe_dill_load(scene_file)
         return scene
 
     def save_scene(self, scene: Scene) -> Path:
@@ -43,8 +40,7 @@ class EnvCache:
         scene_cache_dir: Path = scene_file.parent
         scene_cache_dir.mkdir(parents=True, exist_ok=True)
 
-        with open(scene_file, "wb") as f:
-            dill.dump(scene, f)
+        safe_dill_dump(scene, scene_file)
 
         return scene_file
 
@@ -57,16 +53,15 @@ class EnvCache:
         scene_cache_dir: Path = scene_file.parent
         scene_cache_dir.mkdir(parents=True, exist_ok=True)
 
-        with open(scene_file, "wb") as f:
-            dill.dump(scene, f)
+        safe_dill_dump(scene, scene_file)
 
         return scene_file
 
     def load_env_scenes_list(self, env_name: str) -> List[NamedTuple]:
         env_cache_dir: Path = self.path / env_name
-        with open(env_cache_dir / "scenes_list.dill", "rb") as f:
-            scenes_list: List[NamedTuple] = dill.load(f)
-
+        scenes_list: List[NamedTuple] = safe_dill_load(
+            env_cache_dir / "scenes_list.dill"
+        )
         return scenes_list
 
     def save_env_scenes_list(
@@ -74,12 +69,9 @@ class EnvCache:
     ) -> None:
         env_cache_dir: Path = self.path / env_name
         env_cache_dir.mkdir(parents=True, exist_ok=True)
-        with open(env_cache_dir / "scenes_list.dill", "wb") as f:
-            dill.dump(scenes_list, f)
+        safe_dill_dump(scenes_list, env_cache_dir / "scenes_list.dill")
 
     @staticmethod
     def load(scene_info_path: Union[Path, str]) -> Scene:
-        with open(scene_info_path, "rb") as handle:
-            scene: Scene = dill.load(handle)
-
+        scene: Scene = safe_dill_load(Path(scene_info_path))
         return scene

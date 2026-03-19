@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
@@ -12,6 +13,7 @@ from typing import Dict
 from trajdata.maps.vec_map import VectorMap
 from trajdata.proto.vectorized_map_pb2 import VectorizedMap
 from trajdata.utils import map_utils
+from trajdata.utils.cache_utils import CacheCorruptionError, delete_corrupted_file
 
 
 class MapAPI:
@@ -41,12 +43,20 @@ class MapAPI:
             )
 
             vec_map: VectorMap = VectorMap.from_proto(stored_vec_map, **kwargs)
-            vec_map.search_kdtrees = map_utils.load_kdtrees(
-                env_maps_path / f"{map_name}_kdtrees.dill"
-            )
-            vec_map.search_rtrees = map_utils.load_rtrees(
-                env_maps_path / f"{map_name}_rtrees.dill"
-            )
+
+            kdtrees_path = env_maps_path / f"{map_name}_kdtrees.dill"
+            try:
+                vec_map.search_kdtrees = map_utils.load_kdtrees(kdtrees_path)
+            except CacheCorruptionError:
+                delete_corrupted_file(kdtrees_path)
+                raise
+
+            rtrees_path = env_maps_path / f"{map_name}_rtrees.dill"
+            try:
+                vec_map.search_rtrees = map_utils.load_rtrees(rtrees_path)
+            except CacheCorruptionError:
+                # rtrees already handled (deleted + returns None) in load_rtrees
+                vec_map.search_rtrees = None
 
             if self._keep_in_memory:
                 self.maps[map_id] = vec_map
