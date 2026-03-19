@@ -32,7 +32,12 @@ def _collate_data(elems):
     if hasattr(elems[0], "__collate__"):
         return elems[0].__collate__(elems)
     else:
-        return torch.as_tensor(np.stack(elems))
+        # Use torch.stack directly - faster than np.stack + as_tensor
+        # Handles both numpy arrays and torch tensors
+        if isinstance(elems[0], np.ndarray):
+            return torch.stack([torch.from_numpy(e) for e in elems])
+        else:
+            return torch.stack(elems)
 
 
 def raster_map_collate_fn_agent(
