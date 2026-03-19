@@ -13,11 +13,30 @@ the next dataset initialization -- instead of requiring a full rebuild.
 """
 
 import argparse
+import os
 import pickle
 import sys
 from pathlib import Path
+from typing import Iterator, Tuple
 
 import dill
+from tqdm import tqdm
+
+# File extensions we know how to verify
+_VERIFIABLE_EXTENSIONS = {".dill", ".pkl", ".pb"}
+
+
+def _iter_cache_files(cache_dir: Path) -> Iterator[Tuple[Path, str]]:
+    """Yield (path, file_type) for every verifiable file under cache_dir.
+
+    Uses os.walk to stream results incrementally instead of collecting
+    everything upfront with rglob, so the first file is yielded immediately.
+    """
+    for dirpath, _dirnames, filenames in os.walk(cache_dir):
+        for filename in filenames:
+            ext = os.path.splitext(filename)[1]
+            if ext in _VERIFIABLE_EXTENSIONS:
+                yield Path(dirpath) / filename, ext.lstrip(".")
 
 
 def verify_dill_file(path: Path) -> bool:
@@ -76,29 +95,18 @@ def verify_cache(
         print(f"ERROR: Cache directory does not exist: {cache_dir}")
         return 0, 0, 0
 
-    # Collect all serialized files
-    dill_files = sorted(cache_dir.rglob("*.dill"))
-    pkl_files = sorted(cache_dir.rglob("*.pkl"))
-    pb_files = sorted(cache_dir.rglob("*.pb"))
+    corrupted_paths = []
 
-    all_files = (
-        [(f, "dill") for f in dill_files]
-        + [(f, "pkl") for f in pkl_files]
-        + [(f, "pb") for f in pb_files]
+    pbar = tqdm(
+        _iter_cache_files(cache_dir),
+        desc="Verifying cache",
+        unit=" files",
+        dynamic_ncols=True,
     )
 
-    if not all_files:
-        print(f"No cache files found in {cache_dir}")
-        return 0, 0, 0
-
-    print(f"Verifying {len(all_files)} cache files in {cache_dir}...")
-    print(f"  {len(dill_files)} .dill files")
-    print(f"  {len(pkl_files)} .pkl files")
-    print(f"  {len(pb_files)} .pb files")
-    print()
-
-    for file_path, file_type in all_files:
+    for file_path, file_type in pbar:
         total += 1
+        pbar.set_postfix(checked=total, corrupt=corrupted, refresh=False)
 
         if file_type == "dill":
             valid = verify_dill_file(file_path)
@@ -109,20 +117,26 @@ def verify_cache(
         else:
             continue
 
-        rel_path = file_path.relative_to(cache_dir)
-
         if valid:
             if verbose:
-                print(f"  OK   {rel_path}")
+                rel_path = file_path.relative_to(cache_dir)
+                tqdm.write(f"  OK       {rel_path}")
         else:
             corrupted += 1
+            pbar.set_postfix(checked=total, corrupt=corrupted, refresh=True)
+            rel_path = file_path.relative_to(cache_dir)
             size = file_path.stat().st_size if file_path.exists() else 0
-            print(f"  CORRUPT  {rel_path}  (size: {size} bytes)")
+            tqdm.write(f"  CORRUPT  {rel_path}  (size: {size} bytes)")
 
             if fix:
                 file_path.unlink(missing_ok=True)
                 fixed += 1
-                print(f"           -> DELETED (will regenerate on next init)")
+                tqdm.write(
+                    f"           -> DELETED (will regenerate on next init)"
+                )
+            corrupted_paths.append(rel_path)
+
+    pbar.close()
 
     return total, corrupted, fixed
 
