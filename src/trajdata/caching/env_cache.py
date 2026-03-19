@@ -15,7 +15,7 @@ class EnvCache:
     def scene_is_cached(self, env_name: str, scene_name: str, scene_dt: float) -> bool:
         return EnvCache.scene_metadata_path(
             self.path, env_name, scene_name, scene_dt
-        ).exists()
+        ).is_file()
 
     @staticmethod
     def scene_metadata_path(

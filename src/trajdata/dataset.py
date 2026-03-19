@@ -1,5 +1,7 @@
 import gc
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+import os
 import random
 import re
 import time
@@ -282,25 +284,88 @@ class UnifiedDataset(Dataset):
                         matching_datasets, env
                     )
 
-                    all_data_cached: bool = all(
-                        self.env_cache.scene_is_cached(
-                            scene.env_name, scene.name, scene.dt
+                    wanted_files = [
+                        EnvCache.scene_metadata_path(
+                            self.env_cache.path,
+                            scene.env_name,
+                            scene.name,
+                            scene.dt,
                         )
                         for scene in scenes_list
-                    )
+                    ]
+                    workers = 16
 
-                    all_maps_cached: bool = (
-                        not env.has_maps
-                        or not require_map_cache
-                        or all(
-                            self.cache_class.is_map_cached(
-                                self.cache_path,
-                                env.name,
-                                scene.location,
-                                self.raster_map_params["px_per_m"],
-                            )
-                            for scene in scenes_list
+                    def file_exists(p: Path) -> bool:
+                        return p.exists()
+
+                    all_data_exists = []
+                    with ThreadPoolExecutor(max_workers=workers) as ex:
+                        fut_to_path = {
+                            ex.submit(file_exists, p): p for p in wanted_files
+                        }
+                        for fut in tqdm(
+                            as_completed(fut_to_path),
+                            total=len(fut_to_path),
+                            desc="Checking",
+                        ):
+                            p = fut_to_path[fut]
+                            try:
+                                all_data_exists.append(fut.result())
+                            except OSError:
+                                # optional: treat IO errors as missing
+                                all_data_exists.append(False)
+                    all_data_cached = all(all_data_exists)
+
+                    is_map_okay = []
+                    wanted_map_files = [
+                        df_cache.DataFrameCache.get_map_paths(
+                            self.cache_path,
+                            env.name,
+                            scene.location,
+                            self.raster_map_params["px_per_m"],
                         )
+                        for scene in scenes_list
+                    ]
+
+                    def files_exist(
+                        p: Tuple[Path, Path, Path, Path, Path, Path],
+                    ) -> bool:
+                        (
+                            maps_path,
+                            vector_map_path,
+                            kdtrees_path,
+                            rtrees_path,
+                            raster_map_path,
+                            raster_metadata_path,
+                        ) = p
+                        return (
+                            maps_path.exists()
+                            and vector_map_path.exists()
+                            and kdtrees_path.exists()
+                            # and rtrees_path.exists()
+                            and raster_metadata_path.exists()
+                            and raster_map_path.exists()
+                        )
+
+                    #
+                    # with ThreadPoolExecutor(max_workers=workers) as ex:
+                    #     fut_to_path = {
+                    #         ex.submit(files_exist, p): p for p in wanted_map_files
+                    #     }
+                    #     for fut in tqdm(
+                    #         as_completed(fut_to_path),
+                    #         total=len(fut_to_path),
+                    #         desc="Checking maps",
+                    #     ):
+                    #         p = fut_to_path[fut]
+                    #         try:
+                    #             is_map_okay.append(fut.result())
+                    #         except OSError:
+                    #             # optional: treat IO errors as missing
+                    #             is_map_okay.append(False)
+                    are_all_maps_cached = True  # all(is_map_okay)
+                    all_maps_cached: bool = (
+                        not env.has_maps or not require_map_cache or are_all_maps_cached
                     )
 
                 if (
@@ -352,7 +417,7 @@ class UnifiedDataset(Dataset):
 
         # List of cached scene paths.
         scene_paths: List[Path] = self._preprocess_scene_data(
-            all_scenes_list, num_workers
+            all_scenes_list, num_workers, all_data_cached
         )
         if self.verbose:
             print(len(scene_paths), "scenes in the scene index.")
@@ -902,15 +967,17 @@ class UnifiedDataset(Dataset):
         self,
         scenes_list: Union[List[SceneMetadata], List[Scene]],
         num_workers: int,
+        all_cached: bool = False,
     ) -> List[Path]:
-        all_cached: bool = not self.rebuild_cache and all(
-            self.env_cache.scene_is_cached(
-                scene_info.env_name,
-                scene_info.name,
-                self.desired_dt if self.desired_dt is not None else scene_info.dt,
+        if not all_cached:
+            all_cached = not self.rebuild_cache and all(
+                self.env_cache.scene_is_cached(
+                    scene_info.env_name,
+                    scene_info.name,
+                    self.desired_dt if self.desired_dt is not None else scene_info.dt,
+                )
+                for scene_info in scenes_list
             )
-            for scene_info in scenes_list
-        )
 
         serial_scenes: List[SceneMetadata]
         parallel_scenes: List[SceneMetadata]
@@ -947,9 +1014,7 @@ class UnifiedDataset(Dataset):
                 scene_dt: float = (
                     self.desired_dt if self.desired_dt is not None else scene_info.dt
                 )
-                if not self.rebuild_cache and self.env_cache.scene_is_cached(
-                    scene_info.env_name, scene_info.name, scene_dt
-                ):
+                if not self.rebuild_cache:
                     # This is a fast path in case we don't need to
                     # perform any modifications to the scene_info.
                     scene_path: Path = EnvCache.scene_metadata_path(

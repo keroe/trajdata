@@ -65,6 +65,10 @@ class WaymoDataset(RawDataset):
             # Waymo possibilities are the Cartesian product of these
             dataset_parts = [("test",)]
             scene_split_map = defaultdict(partial(const_lambda, const_val="test"))
+        else:
+            print(
+                f"Didn't provide the correct env or data_ dir. args are: env_name: {env_name} and data_dir: {data_dir}"
+            )
 
         return EnvMetadata(
             name=env_name,
