@@ -1011,8 +1011,11 @@ class UnifiedDataset(Dataset):
                 scene_dt: float = (
                     self.desired_dt if self.desired_dt is not None else scene_info.dt
                 )
-                if not self.rebuild_cache and self.env_cache.scene_is_cached(
-                    scene_info.env_name, scene_info.name, scene_dt
+                if not self.rebuild_cache and (
+                    all_cached
+                    or self.env_cache.scene_is_cached(
+                        scene_info.env_name, scene_info.name, scene_dt
+                    )
                 ):
                     # This is a fast path in case we don't need to
                     # perform any modifications to the scene_info.
