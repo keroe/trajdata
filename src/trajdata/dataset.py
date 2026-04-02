@@ -1,5 +1,6 @@
 import gc
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from multiprocessing import Pool
 import json
 import random
 import re
@@ -775,7 +776,21 @@ class UnifiedDataset(Dataset):
             List[Tuple[str, int, np.ndarray]],
             List[Tuple[str, int, List[Tuple[str, np.ndarray]]]],
         ] = list()
-        if num_workers <= 1:
+
+        # Auto-parallelize for large datasets when num_workers is 0 (default).
+        # Data index creation is I/O-bound (dill.load per scene), so
+        # multiprocessing yields large speedups.
+        effective_workers = num_workers
+        if effective_workers <= 1 and len(scene_paths) > 1000:
+            import os as _os
+            effective_workers = min(_os.cpu_count() or 1, 16)
+            if self.verbose:
+                print(
+                    f"Auto-parallelizing data index creation with "
+                    f"{effective_workers} workers for {len(scene_paths)} scenes."
+                )
+
+        if effective_workers <= 1:
             for scene_info_path in tqdm(
                 scene_paths,
                 desc=desc + " (Serially)",
@@ -787,15 +802,22 @@ class UnifiedDataset(Dataset):
                 if len(index_elems) > 0:
                     data_index.append((str(orig_path), index_elems_len, index_elems))
         else:
-            for _, orig_path, index_elems_len, index_elems in parallel_iapply(
-                data_index_fn,
-                scene_paths,
-                num_workers=num_workers,
-                desc=desc + f" ({num_workers} CPUs)",
-                disable=not self.verbose,
-            ):
-                if len(index_elems) > 0:
-                    data_index.append((str(orig_path), index_elems_len, index_elems))
+            # Use imap_unordered with a reasonable chunksize for better
+            # throughput — order doesn't matter for index construction.
+            chunksize = max(1, len(scene_paths) // (effective_workers * 4))
+            with Pool(processes=effective_workers) as pool:
+                for _, orig_path, index_elems_len, index_elems in tqdm(
+                    pool.imap_unordered(
+                        data_index_fn, scene_paths, chunksize=chunksize
+                    ),
+                    total=len(scene_paths),
+                    desc=desc + f" ({effective_workers} CPUs)",
+                    disable=not self.verbose,
+                ):
+                    if len(index_elems) > 0:
+                        data_index.append(
+                            (str(orig_path), index_elems_len, index_elems)
+                        )
 
         return data_index
 
