@@ -72,7 +72,7 @@ def safe_pickle_dump(obj: Any, target_path: Path) -> None:
     Writes to a temp file first, then renames to target_path.
     If the process is killed mid-write, target_path is never corrupted.
     """
-    atomic_write(target_path, lambda f: pickle.dump(obj, f))
+    atomic_write(target_path, lambda f: pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL))
 
 
 def safe_dill_load(path: Path) -> Any:

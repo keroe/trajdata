@@ -24,6 +24,8 @@ from trajdata.utils.cache_utils import (
     delete_corrupted_file,
     safe_dill_dump,
     safe_dill_load,
+    safe_pickle_dump,
+    safe_pickle_load,
 )
 from trajdata.augmentation.augmentation import Augmentation, BatchAugmentation
 from trajdata.caching import EnvCache, SceneCache, df_cache
@@ -114,7 +116,7 @@ class UnifiedDataset(Dataset):
         cache_location: str = "~/.unified_data_cache",
         rebuild_cache: bool = False,
         rebuild_maps: bool = False,
-        save_index: bool = False,
+        save_index: bool = True,
         num_workers: int = 0,
         verbose: bool = False,
         extras: Dict[str, Callable[..., np.ndarray]] = dict(),
@@ -427,8 +429,11 @@ class UnifiedDataset(Dataset):
             List[Tuple[str, int, np.ndarray]],
             List[Tuple[str, int, List[Tuple[str, np.ndarray]]]],
         ]
-        if self._index_cache_path().exists():
+        _idx_dir = self._index_cache_path()
+        _idx_loaded_from_cache = False
+        if (_idx_dir / "data_index.pkl").is_file() or (_idx_dir / "data_index.dill").is_file():
             data_index = self._load_data_index()
+            _idx_loaded_from_cache = True
         else:
             data_index = self._get_data_index(num_workers, scene_paths)
 
@@ -448,13 +453,7 @@ class UnifiedDataset(Dataset):
         self._data_len: int = len(self._data_index)
 
         # Use only rank 0 process for caching when using multi-GPU torch training.
-        if save_index and rank == 0:
-            if self._index_cache_path().exists():
-                print(
-                    "WARNING: Overwriting already-cached data index (since save_index is True).",
-                    flush=True,
-                )
-
+        if save_index and rank == 0 and not _idx_loaded_from_cache:
             self._cache_data_index(data_index)
 
         # Wait for rank 0 process to be done with caching.
@@ -559,8 +558,8 @@ class UnifiedDataset(Dataset):
         # Create it if it doesn't exist yet.
         index_cache_dir.mkdir(parents=True, exist_ok=True)
 
-        index_cache_file: Path = index_cache_dir / "data_index.dill"
-        safe_dill_dump(data_index, index_cache_file)
+        index_cache_file: Path = index_cache_dir / "data_index.pkl"
+        safe_pickle_dump(data_index, index_cache_file)
 
         args_file: Path = index_cache_dir / "index_args.json"
         with open(args_file, "w") as f:
@@ -577,9 +576,18 @@ class UnifiedDataset(Dataset):
         List[Tuple[str, int, np.ndarray]],
         List[Tuple[str, int, List[Tuple[str, np.ndarray]]]],
     ]:
-        index_cache_file: Path = self._index_cache_path() / "data_index.dill"
+        index_cache_dir = self._index_cache_path()
+        index_cache_file: Path = index_cache_dir / "data_index.pkl"
+        # Backward compatibility: fall back to old dill format
+        if not index_cache_file.is_file():
+            legacy_file = index_cache_dir / "data_index.dill"
+            if legacy_file.is_file():
+                index_cache_file = legacy_file
         try:
-            data_index = safe_dill_load(index_cache_file)
+            if index_cache_file.suffix == ".dill":
+                data_index = safe_dill_load(index_cache_file)
+            else:
+                data_index = safe_pickle_load(index_cache_file)
         except CacheCorruptionError:
             delete_corrupted_file(index_cache_file)
             raise
