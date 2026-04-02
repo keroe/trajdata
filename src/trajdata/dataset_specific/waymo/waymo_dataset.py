@@ -1,4 +1,5 @@
 import os
+import warnings
 from collections import defaultdict
 from functools import partial
 from pathlib import Path
@@ -66,8 +67,10 @@ class WaymoDataset(RawDataset):
             dataset_parts = [("test",)]
             scene_split_map = defaultdict(partial(const_lambda, const_val="test"))
         else:
-            print(
-                f"Didn't provide the correct env or data_ dir. args are: env_name: {env_name} and data_dir: {data_dir}"
+            warnings.warn(
+                f"Unrecognized Waymo env_name '{env_name}' with data_dir '{data_dir}'. "
+                f"Expected one of: waymo_train, waymo_val, waymo_test.",
+                UserWarning,
             )
 
         return EnvMetadata(

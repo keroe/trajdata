@@ -88,7 +88,6 @@ def safe_dill_load(path: Path) -> Any:
         CacheCorruptionError: If the file is corrupted or truncated.
         FileNotFoundError: If the file does not exist.
     """
-    path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Cache file not found: {path}")
 
@@ -112,7 +111,6 @@ def safe_pickle_load(path: Path) -> Any:
         CacheCorruptionError: If the file is corrupted or truncated.
         FileNotFoundError: If the file does not exist.
     """
-    path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Cache file not found: {path}")
 
@@ -130,7 +128,6 @@ def delete_corrupted_file(path: Path, warn: bool = True) -> None:
         path: Path to the corrupted file.
         warn: Whether to emit a warning about the deletion.
     """
-    path = Path(path)
     if path.exists():
         path.unlink()
         if warn:
