@@ -463,6 +463,12 @@ class UnifiedDataset(Dataset):
 
         self._cached_batch_elements = None
 
+        # LRU cache for Scene objects loaded during __getitem__.
+        # Avoids redundant dill deserialization when multiple agents
+        # are sampled from the same scene.
+        self._scene_cache: Dict[str, Scene] = {}
+        self._scene_cache_maxsize: int = 512
+
     def check_args_combinations(self, chosen_datasets: List[SceneTag]) -> None:
         """Warn users about potential "gotcha" combinations of arguments,
         usually involving fundamental limits in datasets.
@@ -1162,14 +1168,17 @@ class UnifiedDataset(Dataset):
     def __len__(self) -> int:
         return self._data_len
 
-    def __getitem__(self, idx: int) -> Union[SceneBatchElement, AgentBatchElement]:
-        if self._cached_batch_elements is not None:
-            return self._cached_batch_elements[idx]
+    def _load_scene_cached(self, scene_path: str) -> Scene:
+        """Load a Scene from cache with LRU caching.
 
-        if self.centric == "scene":
-            scene_path, ts = self._data_index[idx]
-        elif self.centric == "agent":
-            scene_path, agent_id, ts = self._data_index[idx]
+        Cached so that multiple agents from the same scene don't re-read
+        the dill file from disk. enforce_desired_dt is applied once on
+        cache miss; subsequent calls return the already-adjusted Scene.
+        The Scene is never mutated after that, so sharing is safe.
+        """
+        cached = self._scene_cache.get(scene_path)
+        if cached is not None:
+            return cached
 
         try:
             scene: Scene = EnvCache.load(scene_path)
@@ -1181,6 +1190,24 @@ class UnifiedDataset(Dataset):
             ) from e
 
         scene_utils.enforce_desired_dt(scene, self.desired_dt)
+
+        # Evict oldest entry if at capacity
+        if len(self._scene_cache) >= self._scene_cache_maxsize:
+            self._scene_cache.pop(next(iter(self._scene_cache)))
+
+        self._scene_cache[scene_path] = scene
+        return scene
+
+    def __getitem__(self, idx: int) -> Union[SceneBatchElement, AgentBatchElement]:
+        if self._cached_batch_elements is not None:
+            return self._cached_batch_elements[idx]
+
+        if self.centric == "scene":
+            scene_path, ts = self._data_index[idx]
+        elif self.centric == "agent":
+            scene_path, agent_id, ts = self._data_index[idx]
+
+        scene: Scene = self._load_scene_cached(scene_path)
         scene_cache: SceneCache = self.cache_class(
             self.cache_path, scene, self.augmentations
         )

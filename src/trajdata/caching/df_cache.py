@@ -47,6 +47,36 @@ EXTENT_COLS: Final[List[str]] = ["length", "width", "height"]
 STATE_FORMAT_STR: Final[str] = "x,y,z,xd,yd,xdd,ydd,h"
 RawStateArray = NP_STATE_TYPES[STATE_FORMAT_STR]
 
+# ---------------------------------------------------------------------------
+# Module-level LRU cache for loaded agent data (DataFrame + index dict).
+# Keyed by (scene_dir, scene_dt, augmentation_key).
+# This avoids redundant feather + pickle reads when multiple agents from the
+# same scene are sampled in the same (or nearby) batches.
+# ---------------------------------------------------------------------------
+_AGENT_DATA_CACHE_MAXSIZE: int = 256
+_agent_data_cache: Dict[Tuple, Tuple[pd.DataFrame, Dict]] = {}
+_agent_data_cache_order: List[Tuple] = []  # insertion order for LRU eviction
+
+
+def _get_augmentation_key(
+    augmentations: Optional[List[Augmentation]],
+) -> Tuple[str, ...]:
+    """Return a hashable key representing which DatasetAugmentations are active."""
+    if not augmentations:
+        return ()
+    return tuple(
+        type(aug).__qualname__
+        for aug in augmentations
+        if isinstance(aug, DatasetAugmentation)
+    )
+
+
+def _evict_oldest_agent_data() -> None:
+    """Evict the oldest entry from the agent data cache."""
+    if _agent_data_cache_order:
+        oldest_key = _agent_data_cache_order.pop(0)
+        _agent_data_cache.pop(oldest_key, None)
+
 
 class DataFrameCache(SceneCache):
     def __init__(
@@ -63,32 +93,80 @@ class DataFrameCache(SceneCache):
         """
         super().__init__(cache_path, scene, augmentations)
 
-        agent_data_path: Path = self.scene_dir / DataFrameCache._agent_data_file(
-            scene.dt
-        )
-        if not agent_data_path.exists():
-            # Load the original dt agent data and then
-            # interpolate it to the desired dt.
-            self._load_agent_data(scene.env_metadata.dt)
-            self.interpolate_data(scene.dt)
+        aug_key = _get_augmentation_key(augmentations)
+        cache_key = (str(self.scene_dir), scene.dt, aug_key)
+
+        cached = _agent_data_cache.get(cache_key)
+        if cached is not None:
+            # Cache hit: reuse the loaded DataFrame, index dict,
+            # and precomputed column metadata.
+            (
+                self.scene_data_df,
+                self.index_dict,
+                self.column_dict,
+                self.pos_cols,
+                self.z_cols,
+                self.vel_cols,
+                self.acc_cols,
+                self.heading_cols,
+                self.state_cols,
+                self._state_dim,
+                self.extent_cols,
+            ) = cached
+            # Move to end of LRU order
+            try:
+                _agent_data_cache_order.remove(cache_key)
+            except ValueError:
+                pass
+            _agent_data_cache_order.append(cache_key)
         else:
-            # Load the data with the desired dt.
-            self._load_agent_data(scene.dt)
+            # Cache miss: load from disk
+            agent_data_path: Path = self.scene_dir / DataFrameCache._agent_data_file(
+                scene.dt
+            )
+            if not agent_data_path.exists():
+                # Load the original dt agent data and then
+                # interpolate it to the desired dt.
+                self._load_agent_data(scene.env_metadata.dt)
+                self.interpolate_data(scene.dt)
+            else:
+                # Load the data with the desired dt.
+                self._load_agent_data(scene.dt)
+
+            if augmentations:
+                dataset_augments: List[DatasetAugmentation] = [
+                    augment
+                    for augment in augmentations
+                    if isinstance(augment, DatasetAugmentation)
+                ]
+                for aug in dataset_augments:
+                    aug.apply(self.scene_data_df)
+
+            self._get_and_reorder_col_idxs()
+
+            # Store in cache
+            while len(_agent_data_cache) >= _AGENT_DATA_CACHE_MAXSIZE:
+                _evict_oldest_agent_data()
+            _agent_data_cache[cache_key] = (
+                self.scene_data_df,
+                self.index_dict,
+                self.column_dict,
+                self.pos_cols,
+                self.z_cols,
+                self.vel_cols,
+                self.acc_cols,
+                self.heading_cols,
+                self.state_cols,
+                self._state_dim,
+                self.extent_cols,
+            )
+            _agent_data_cache_order.append(cache_key)
 
         # Setting default data transformation parameters.
         self.reset_obs_format()
         self.reset_obs_frame()
 
         self._kdtrees = None
-
-        if augmentations:
-            dataset_augments: List[DatasetAugmentation] = [
-                augment
-                for augment in augmentations
-                if isinstance(augment, DatasetAugmentation)
-            ]
-            for aug in dataset_augments:
-                aug.apply(self.scene_data_df)
 
     @staticmethod
     def _agent_data_file(scene_dt: float) -> str:

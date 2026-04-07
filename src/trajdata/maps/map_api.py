@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import warnings
 from typing import TYPE_CHECKING, Optional
 
@@ -64,10 +65,17 @@ class MapAPI:
             vec_map = self.maps[map_id]
 
         if scene_cache is not None:
-            vec_map.associate_scene_data(
-                scene_cache.get_traffic_light_status_dict(
-                    kwargs.get("desired_dt", None)
-                )
+            tl_status = scene_cache.get_traffic_light_status_dict(
+                kwargs.get("desired_dt", None)
             )
+            if self._keep_in_memory:
+                # Return a shallow copy so the cached VectorMap's geometry
+                # (elements, kdtrees, rtrees, numpy arrays) stays shared
+                # while traffic_light_status is scene-specific.
+                # This prevents copy-on-write memory duplication in forked
+                # DataLoader workers and fixes a correctness bug where
+                # concurrent scenes would overwrite each other's TL data.
+                vec_map = copy.copy(vec_map)
+            vec_map.associate_scene_data(tl_status)
 
         return vec_map
