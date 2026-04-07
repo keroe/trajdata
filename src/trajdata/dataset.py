@@ -286,84 +286,93 @@ class UnifiedDataset(Dataset):
                         matching_datasets, env
                     )
 
-                    # Parallel check for scene metadata files
-                    wanted_files = [
-                        EnvCache.scene_metadata_path(
-                            self.env_cache.path,
-                            scene.env_name,
-                            scene.name,
-                            scene.dt,
-                        )
-                        for scene in scenes_list
-                    ]
-                    workers = min(16, len(wanted_files) or 1)
-
-                    all_data_exists = []
-                    with ThreadPoolExecutor(max_workers=workers) as ex:
-                        fut_to_path = {
-                            ex.submit(lambda p: p.is_file(), p): p
-                            for p in wanted_files
-                        }
-                        for fut in tqdm(
-                            as_completed(fut_to_path),
-                            total=len(fut_to_path),
-                            desc=f"Checking scenes ({env.name})",
-                        ):
-                            try:
-                                all_data_exists.append(fut.result())
-                            except OSError:
-                                all_data_exists.append(False)
-                    all_data_cached = all(all_data_exists)
-
-                    # Parallel check for map files (only when maps are required)
-                    if require_map_cache and env.has_maps:
-                        wanted_map_files = [
-                            df_cache.DataFrameCache.get_map_paths(
-                                self.cache_path,
-                                env.name,
-                                scene.location,
-                                self.raster_map_params["px_per_m"],
+                    # Only rank 0 performs expensive parallel cache validation.
+                    # Other ranks skip this and assume cache exists (validated by rank 0).
+                    if rank == 0:
+                        # Parallel check for scene metadata files
+                        wanted_files = [
+                            EnvCache.scene_metadata_path(
+                                self.env_cache.path,
+                                scene.env_name,
+                                scene.name,
+                                scene.dt,
                             )
                             for scene in scenes_list
                         ]
+                        workers = min(16, len(wanted_files) or 1)
 
-                        def _map_files_exist(
-                            paths: Tuple[Path, Path, Path, Path, Path, Path],
-                        ) -> bool:
-                            (
-                                maps_path,
-                                vector_map_path,
-                                kdtrees_path,
-                                _rtrees_path,
-                                raster_map_path,
-                                raster_metadata_path,
-                            ) = paths
-                            return (
-                                maps_path.exists()
-                                and vector_map_path.exists()
-                                and kdtrees_path.exists()
-                                # rtrees are optional (see df_cache.is_map_cached)
-                                and raster_metadata_path.exists()
-                                and raster_map_path.exists()
-                            )
-
-                        map_workers = min(16, len(wanted_map_files) or 1)
-                        map_results = []
-                        with ThreadPoolExecutor(max_workers=map_workers) as ex:
+                        all_data_exists = []
+                        with ThreadPoolExecutor(max_workers=workers) as ex:
                             fut_to_path = {
-                                ex.submit(_map_files_exist, p): p
-                                for p in wanted_map_files
+                                ex.submit(lambda p: p.is_file(), p): p
+                                for p in wanted_files
                             }
                             for fut in tqdm(
                                 as_completed(fut_to_path),
                                 total=len(fut_to_path),
-                                desc=f"Checking maps ({env.name})",
+                                desc=f"Checking scenes ({env.name})",
+                                disable=not self.verbose,
                             ):
                                 try:
-                                    map_results.append(fut.result())
+                                    all_data_exists.append(fut.result())
                                 except OSError:
-                                    map_results.append(False)
-                        all_maps_cached = all(map_results)
+                                    all_data_exists.append(False)
+                        all_data_cached = all(all_data_exists)
+
+                        # Parallel check for map files (only when maps are required)
+                        if require_map_cache and env.has_maps:
+                            wanted_map_files = [
+                                df_cache.DataFrameCache.get_map_paths(
+                                    self.cache_path,
+                                    env.name,
+                                    scene.location,
+                                    self.raster_map_params["px_per_m"],
+                                )
+                                for scene in scenes_list
+                            ]
+
+                            def _map_files_exist(
+                                paths: Tuple[Path, Path, Path, Path, Path, Path],
+                            ) -> bool:
+                                (
+                                    maps_path,
+                                    vector_map_path,
+                                    kdtrees_path,
+                                    _rtrees_path,
+                                    raster_map_path,
+                                    raster_metadata_path,
+                                ) = paths
+                                return (
+                                    maps_path.exists()
+                                    and vector_map_path.exists()
+                                    and kdtrees_path.exists()
+                                    # rtrees are optional (see df_cache.is_map_cached)
+                                    and raster_metadata_path.exists()
+                                    and raster_map_path.exists()
+                                )
+
+                            map_workers = min(16, len(wanted_map_files) or 1)
+                            map_results = []
+                            with ThreadPoolExecutor(max_workers=map_workers) as ex:
+                                fut_to_path = {
+                                    ex.submit(_map_files_exist, p): p
+                                    for p in wanted_map_files
+                                }
+                                for fut in tqdm(
+                                    as_completed(fut_to_path),
+                                    total=len(fut_to_path),
+                                    desc=f"Checking maps ({env.name})",
+                                    disable=not self.verbose,
+                                ):
+                                    try:
+                                        map_results.append(fut.result())
+                                    except OSError:
+                                        map_results.append(False)
+                            all_maps_cached = all(map_results)
+                    else:
+                        # Non-rank-0: assume cache is valid (rank 0 already validated)
+                        all_data_cached = True
+                        all_maps_cached = True
 
                 if (
                     not all_data_cached
@@ -401,7 +410,8 @@ class UnifiedDataset(Dataset):
                         self._get_desired_scenes_from_env(matching_datasets, env)
                     )
 
-                if self.incl_vector_map and env.metadata.map_locations is not None:
+                # Pre-load vector maps only on rank 0 to avoid redundant disk I/O
+                if rank == 0 and self.incl_vector_map and env.metadata.map_locations is not None:
                     # env.metadata.map_locations can be none for map-containing
                     # datasets if they have a huge number of maps
                     # (or map crops, like Waymo).
