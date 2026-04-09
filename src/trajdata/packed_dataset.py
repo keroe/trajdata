@@ -11,12 +11,33 @@ from typing import Dict, List, Optional, Tuple
 
 import lmdb
 import numpy as np
-import torch
 from torch.utils.data import Dataset
 
 from trajdata.data_structures.collation import agent_collate_fn
-from trajdata.data_structures.state import NP_STATE_TYPES, StateArray
+from trajdata.data_structures.state import NP_STATE_TYPES, TORCH_STATE_TYPES
 from trajdata.data_structures.agent import AgentType
+
+
+class _ArrayWithFormat(np.ndarray):
+    """numpy ndarray subclass with a ._format instance attribute.
+
+    collation.py line 308 reads `curr_agent_state_np._format` for the state
+    format string; line 374 calls `torch.as_tensor(curr_agent_state_np, ...)`.
+    Both require a real ndarray.
+
+    Unlike the dynamic StateArray subclasses (StateArrayXYZXdYdXddYddH...),
+    this class has a fixed name in a fixed module, so pickle can always find it
+    in every DDP rank subprocess without triggering AttributeError.
+    """
+
+    def __new__(cls, arr: np.ndarray, fmt: str):
+        obj = np.asarray(arr).view(cls)
+        obj._format = fmt
+        return obj
+
+    def __array_finalize__(self, obj):
+        # Called whenever a new view/copy is made; propagate _format.
+        self._format = getattr(obj, "_format", "")
 
 
 class _ObsTypeStub:
@@ -85,8 +106,10 @@ class PackedBatchElement:
         self.history_sec = history_sec
         self.future_sec = future_sec
 
-        # StateArray must have ._format for collation line 308
-        self.curr_agent_state_np = StateArray.from_array(
+        # _ArrayWithFormat gives collation the ._format it needs (line 308)
+        # without using dynamic StateArray subclasses that break IPC pickling
+        # in DDP rank subprocesses.
+        self.curr_agent_state_np = _ArrayWithFormat(
             data["curr_agent_state_np"], state_format
         )
         self.agent_history_np = data["agent_history_np"]
@@ -148,6 +171,17 @@ class PackedDataset(Dataset):
         self._obs_format = metadata["obs_format"]
         self._history_sec = metadata["history_sec"]
         self._future_sec = metadata["future_sec"]
+
+        # Pre-register dynamic state/obs tensor types in this process.
+        # UnifiedDataset does this in __init__ (self.torch_state_type = ...).
+        # Without it, agent_collate_fn running in DataLoader workers creates
+        # StateTensorXYZ... via createStateType → globals()[name] = cls, but
+        # the parent DDP rank process never runs createStateType for that format
+        # and can't deserialize the collated AgentBatch from the worker queue.
+        NP_STATE_TYPES[self._state_format]
+        NP_STATE_TYPES[self._obs_format]
+        TORCH_STATE_TYPES[self._state_format]
+        TORCH_STATE_TYPES[self._obs_format]
 
     def _open_lmdb(self) -> None:
         self._env = lmdb.open(
