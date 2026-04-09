@@ -2,6 +2,7 @@ import gc
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from multiprocessing import Pool
 import json
+import pickle
 import random
 import re
 import time
@@ -60,6 +61,63 @@ from trajdata.utils import (
     string_utils,
 )
 from trajdata.utils.parallel_utils import parallel_iapply
+
+
+class _PackingDataset(Dataset):
+    """Wraps UnifiedDataset and applies _element_to_dict inside the worker.
+
+    This ensures only plain numpy arrays and Python scalars cross the
+    DataLoader IPC queue — no torch tensors, no shared-memory FD passing,
+    no 'received 0 items of ancdata' errors.
+    """
+
+    def __init__(self, dataset: "UnifiedDataset"):
+        self._dataset = dataset
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+    def __getitem__(self, idx: int) -> dict:
+        return _element_to_dict(self._dataset[idx])
+
+
+def _element_to_dict(elem) -> dict:
+    """Serialize an AgentBatchElement to a dict of plain numpy arrays for LMDB storage."""
+    import torch
+
+    def _to_np(v):
+        if isinstance(v, torch.Tensor):
+            return v.numpy()
+        return np.asarray(v)
+
+    return {
+        "data_index": elem.data_index,
+        "scene_ts": elem.scene_ts,
+        "dt": elem.dt,
+        "agent_name": elem.agent_name,
+        "agent_type": elem.agent_type.value,
+        "scene_id": elem.scene_id,
+        "curr_agent_state_np": np.asarray(elem.curr_agent_state_np),
+        "agent_history_np": np.asarray(elem.agent_history_np),
+        "agent_history_extent_np": np.asarray(elem.agent_history_extent_np),
+        "agent_history_len": elem.agent_history_len,
+        "agent_future_np": np.asarray(elem.agent_future_np),
+        "agent_future_extent_np": np.asarray(elem.agent_future_extent_np),
+        "agent_future_len": elem.agent_future_len,
+        "agent_from_world_tf": elem.agent_from_world_tf,
+        "num_neighbors": elem.num_neighbors,
+        "neighbor_types_np": np.asarray(elem.neighbor_types_np),
+        "neighbor_histories": [np.asarray(h) for h in elem.neighbor_histories],
+        "neighbor_history_extents": [np.asarray(e) for e in elem.neighbor_history_extents],
+        "neighbor_history_lens_np": np.asarray(elem.neighbor_history_lens_np),
+        "neighbor_futures": [np.asarray(f) for f in elem.neighbor_futures],
+        "neighbor_future_extents": [np.asarray(e) for e in elem.neighbor_future_extents],
+        "neighbor_future_lens_np": np.asarray(elem.neighbor_future_lens_np),
+        "robot_future_np": (
+            np.asarray(elem.robot_future_np) if elem.robot_future_np is not None else None
+        ),
+        "extras": {k: _to_np(v) for k, v in elem.extras.items()},
+    }
 
 
 class UnifiedDataset(Dataset):
@@ -1288,3 +1346,95 @@ class UnifiedDataset(Dataset):
             batch_element.vec_map = None
 
         return batch_element
+
+    def pack_to_lmdb(
+        self,
+        lmdb_path: "str | Path",
+        *,
+        num_workers: int = 0,
+        batch_size: int = 64,
+        map_size: int = 100 * 1024**3,
+        write_frequency: int = 1000,
+        log_fn: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        """Pre-pack all samples into an LMDB file for fast training.
+
+        Each sample is serialized as a pickle dict of numpy arrays. The
+        resulting LMDB can be loaded with PackedDataset for O(1) __getitem__.
+
+        Args:
+            lmdb_path: Destination directory for the LMDB file.
+            num_workers: Number of DataLoader workers for parallel reading.
+            batch_size: Samples per DataLoader batch. Higher values amortize
+                        worker coordination overhead. Ignored when num_workers=0.
+            map_size: LMDB virtual address space in bytes (Linux: virtual only,
+                      no physical allocation until written). Default 100 GB.
+            write_frequency: Commit LMDB transaction every N samples.
+            log_fn: Optional logging callback; defaults to print.
+        """
+        import lmdb
+
+        if log_fn is None:
+            log_fn = print
+
+        lmdb_path = Path(lmdb_path)
+        # writemap=True + map_async=True: memory-mapped writes, async fsync —
+        # dramatically faster on Linux for bulk sequential writes.
+        env = lmdb.open(
+            str(lmdb_path),
+            map_size=map_size,
+            writemap=True,
+            map_async=True,
+        )
+
+        idx = 0
+        txn = env.begin(write=True)
+
+        if num_workers > 0:
+            # _PackingDataset converts AgentBatchElement → plain numpy dict
+            # inside the worker, so only numpy arrays cross the IPC queue.
+            # This avoids torch shared-memory FD passing (the cause of
+            # "received 0 items of ancdata" errors with multi-worker loading).
+            packing_ds = _PackingDataset(self)
+            loader = DataLoader(
+                packing_ds,
+                batch_size=batch_size,
+                collate_fn=lambda x: x,   # return list of dicts, no collation
+                num_workers=num_workers,
+                shuffle=False,
+                prefetch_factor=2,
+                persistent_workers=True,
+            )
+            pbar = tqdm(total=len(self), desc="Packing LMDB")
+            for batch in loader:
+                for data in batch:
+                    txn.put(str(idx).encode(), pickle.dumps(data, protocol=5))
+                    idx += 1
+                    if idx % write_frequency == 0:
+                        txn.commit()
+                        txn = env.begin(write=True)
+                pbar.update(len(batch))
+            pbar.close()
+        else:
+            for elem in tqdm(self, desc="Packing LMDB", total=len(self)):
+                txn.put(str(idx).encode(), pickle.dumps(_element_to_dict(elem), protocol=5))
+                idx += 1
+                if idx % write_frequency == 0:
+                    txn.commit()
+                    txn = env.begin(write=True)
+
+        # Write metadata
+        metadata = {
+            "length": len(self),
+            "state_format": self.state_format,
+            "obs_format": self.obs_format,
+            "history_sec": self.history_sec,
+            "future_sec": self.future_sec,
+            "pad_format": "outside",
+        }
+        txn.put(b"__metadata__", pickle.dumps(metadata, protocol=5))
+        txn.commit()
+        env.close()
+
+        size_mb = sum(f.stat().st_size for f in lmdb_path.iterdir()) / 1024**2
+        log_fn(f"Packed {len(self)} samples → {lmdb_path} ({size_mb:.1f} MB)")
