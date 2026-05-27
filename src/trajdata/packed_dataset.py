@@ -192,6 +192,21 @@ class PackedDataset(Dataset):
             meminit=False,
         )
 
+    def __getstate__(self) -> dict:
+        # An open lmdb.Environment is unpicklable, so drop it before the
+        # dataset is sent to DataLoader workers (multiprocessing_context="spawn"
+        # pickles the dataset). Each worker reopens its own handle lazily on the
+        # first __getitem__. Without this, any code that touches the env in the
+        # main process (e.g. dataset[0] during config validation) would leave a
+        # live Environment that breaks spawn pickling.
+        state = self.__dict__.copy()
+        state["_env"] = None
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        self._env = None
+
     def __len__(self) -> int:
         return self._length
 
