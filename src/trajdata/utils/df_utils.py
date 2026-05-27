@@ -11,7 +11,9 @@ def downsample_multi_index_df(
     Downsamples MultiIndex dataframe, assuming level=1 of the index
     corresponds to the scene timestep.
     """
-    subsampled_df = df.groupby(level=0).apply(
+    if df.empty:
+        return df.copy()
+    subsampled_df = df.groupby(level=0, group_keys=True).apply(
         lambda g: g.reset_index(level=0, drop=True)
         .iloc[::downsample_dt_factor]
         .rename(index=lambda ts: ts // downsample_dt_factor)
@@ -65,7 +67,9 @@ def upsample_multi_index_df(
     preprocess: Optional[Callable[[pd.DataFrame], pd.DataFrame]] = None,
     postprocess: Optional[Callable[[pd.DataFrame], pd.DataFrame]] = None,
 ) -> pd.DataFrame:
-    return df.groupby(level=[0]).apply(
+    if df.empty:
+        return df.copy()
+    return df.groupby(level=[0], group_keys=True).apply(
         lambda g: upsample_ts_index_df(
             g.reset_index(level=[0], drop=True),
             upsample_dt_factor,

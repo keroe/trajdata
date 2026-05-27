@@ -148,11 +148,16 @@ class NuPlanObject:
             query, self.connection, index_col="lpc_token", params=(scene_token,)
         )
 
-    def get_detected_agents(self, binary_lpc_tokens: List[bytearray]) -> pd.DataFrame:
-        query = f"""
+    def get_detected_agents(self, scene: Scene) -> pd.DataFrame:
+        # Filter via scene_token through an indexed join on lidar_pc rather
+        # than a 400-element BLOB IN-list of lpc tokens. The category name
+        # is also pulled in via JOIN instead of a per-row correlated
+        # subquery, letting SQLite filter at join time.
+        scene_token = bytearray.fromhex(scene.name.split("=", 1)[1])
+        query = """
         SELECT  lb.lidar_pc_token,
                 lb.track_token,
-                (SELECT category.name FROM category WHERE category.token = tr.category_token) AS category_name,
+                cat.name AS category_name,
                 tr.width,
                 tr.length,
                 tr.height,
@@ -163,23 +168,25 @@ class NuPlanObject:
                 lb.vy,
                 lb.yaw
         FROM lidar_box AS lb
+        INNER JOIN lidar_pc AS lpc ON lb.lidar_pc_token = lpc.token
         LEFT JOIN track AS tr ON lb.track_token = tr.token
-
-        WHERE lidar_pc_token IN ({('?,'*len(binary_lpc_tokens))[:-1]}) AND category_name IN ('vehicle', 'bicycle', 'pedestrian')
+        LEFT JOIN category AS cat ON tr.category_token = cat.token
+        WHERE lpc.scene_token = ?
+              AND cat.name IN ('vehicle', 'bicycle', 'pedestrian')
         """
-        return pd.read_sql_query(query, self.connection, params=binary_lpc_tokens)
+        return pd.read_sql_query(query, self.connection, params=(scene_token,))
 
-    def get_traffic_light_status(
-        self, binary_lpc_tokens: List[bytearray]
-    ) -> pd.DataFrame:
-        query = f"""
+    def get_traffic_light_status(self, scene: Scene) -> pd.DataFrame:
+        scene_token = bytearray.fromhex(scene.name.split("=", 1)[1])
+        query = """
         SELECT  tls.lidar_pc_token AS lidar_pc_token,
                 tls.lane_connector_id AS lane_id,
                 tls.status AS raw_status
-        FROM traffic_light_status AS tls 
-        WHERE lidar_pc_token IN ({('?,'*len(binary_lpc_tokens))[:-1]});
+        FROM traffic_light_status AS tls
+        INNER JOIN lidar_pc AS lpc ON tls.lidar_pc_token = lpc.token
+        WHERE lpc.scene_token = ?;
         """
-        df = pd.read_sql_query(query, self.connection, params=binary_lpc_tokens)
+        df = pd.read_sql_query(query, self.connection, params=(scene_token,))
         df["status"] = df["raw_status"].map(NUPLAN_TRAFFIC_STATUS_DICT)
         df["lane_id"] = df["lane_id"].astype(str)
         return df.drop(columns=["raw_status"])

@@ -76,7 +76,7 @@ class NuplanDataset(RawDataset):
         if self.name == "nuplan_mini":
             subfolder = "mini"
         elif self.name.startswith("nuplan"):
-            subfolder = "trainval"
+            subfolder = "splits/trainval"
 
         self.dataset_obj = nuplan_utils.NuPlanObject(self.metadata.data_dir, subfolder)
 
@@ -249,8 +249,8 @@ class NuplanDataset(RawDataset):
         ego_df["agent_id"] = "ego"
 
         lpc_tokens: List[bytearray] = all_frames.index.tolist()
-        agents_df: pd.DataFrame = self.dataset_obj.get_detected_agents(lpc_tokens)
-        tls_df: pd.DataFrame = self.dataset_obj.get_traffic_light_status(lpc_tokens)
+        agents_df: pd.DataFrame = self.dataset_obj.get_detected_agents(scene)
+        tls_df: pd.DataFrame = self.dataset_obj.get_traffic_light_status(scene)
 
         self.dataset_obj.close_db()
 

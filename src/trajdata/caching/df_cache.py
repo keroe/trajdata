@@ -771,7 +771,11 @@ class DataFrameCache(SceneCache):
             tls_data_df: pd.DataFrame = pd.read_feather(
                 tls_data_path,
                 use_threads=False,
-            ).set_index(["lane_id", "scene_ts"])
+            )
+            if not {"lane_id", "scene_ts"}.issubset(tls_data_df.columns):
+                # Empty / schema-less cache: scene has no traffic light data.
+                return {}
+            tls_data_df = tls_data_df.set_index(["lane_id", "scene_ts"])
 
         # Return data as dict
         return {
