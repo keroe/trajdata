@@ -42,6 +42,7 @@ av2 = ["av2==0.2.1"]
 dev = ["black", "isort", "pytest", "pytest-xdist", "twine", "build"]
 interaction = ["lanelet2==1.2.1"]
 lyft = ["l5kit==1.5.0"]
+nuplan = ["nuplan-devkit"]
 nusc = ["nuscenes-devkit==1.1.9"]
 packed = ["lmdb>=1.4.0"]
 waymo = ["tensorflow==2.11.0", "waymo-open-dataset-tf-2-11-0", "intervaltree"]
@@ -50,3 +51,7 @@ vod = ["vod-devkit==1.1.1"]
 [project.urls]
 "Homepage" = "https://github.com/nvr-avg/trajdata"
 "Bug Tracker" = "https://github.com/nvr-avg/trajdata/issues"
+
+[tool.uv.sources]
+nuplan-devkit = { path = "../nuplan-devkit", editable = true }
+
